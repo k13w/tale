@@ -40,10 +40,11 @@ pip install -r requirements.txt
 
 ```bash
 # Modo interativo
-python main.py
+python3 main.py
 
 # Ou com query direta
-python main.py "Qual é a documentação da API?"
+python3 main.py corriga meu tenant 36, userid 12, transaction id:bfe877fd-1007-4712-be2e-283088e83265, amount: 0.40
+
 ```
 
 ---

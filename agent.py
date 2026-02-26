@@ -1,5 +1,6 @@
 import re
 import json
+import uuid
 from typing import Optional, Dict, Any
 from langchain_ollama import ChatOllama
 from langchain.prompts import ChatPromptTemplate
@@ -25,78 +26,119 @@ class Agent:
         self.conversation_history = []
         self.max_iterations = 10  # Limite de iterações para evitar loops infinitos
 
+        # Rastreamento de estado para detectar loops e conclusões
+        self.execution_history = []  # Histórico de execuções (tool + resultado)
+        self.last_tool_call = None  # Última tool chamada
+        self.consecutive_successes = 0  # Contador de sucessos consecutivos
+
     def _format_tools_description(self) -> str:
         """Retorna descrição formatada das tools disponíveis"""
         return """
-## Tools Disponíveis:
+## Tools Disponíveis (FORMATO: <tool>{...}</tool>):
 
-### 🌐 API Calls - Use quando precisar:
-- Buscar dados de uma URL
-- Fazer requisições HTTP/HTTPS
-- Chamar APIs REST
-- Obter informações de serviços externos
+### 🌐 API Calls
+Use quando precisar: buscar dados, chamar APIs, fazer requisições HTTP/HTTPS
 
-**api.call_api(url, method, headers, data, params)**
-Exemplos de uso:
-```
-<tool>{"tool": "api", "action": "call_api", "url": "https://api.github.com/users/octocat", "method": "GET"}</tool>
-<tool>{"tool": "api", "action": "call_api", "url": "https://jsonplaceholder.typicode.com/posts", "method": "POST", "data": {"title": "foo", "body": "bar"}}</tool>
-```
+FORMATO:
+<tool>{"tool": "api", "action": "call_api", "url": "https://...", "method": "GET", "headers": {...}, "data": {...}}</tool>
 
-### 📁 File Operations - Use quando precisar:
-- Ler conteúdo de arquivos
-- Salvar dados em arquivos
-- Criar novos arquivos
-
-**file.read_file(filepath)** - Ler arquivo
-**file.write_file(filepath, content)** - Escrever arquivo
-Exemplos:
-```
-<tool>{"tool": "file", "action": "read_file", "filepath": "./config.json"}</tool>
-<tool>{"tool": "file", "action": "write_file", "filepath": "./output.txt", "content": "Hello World"}</tool>
-```
-
-### 📊 JSON Processing - Use quando precisar:
-- Validar JSON
-- Fazer parse de strings JSON
-
-**json.parse_json(content)** - Parse JSON
-**json.validate_json(content)** - Validar JSON
-
-### 🐛 Debug & Analysis - Use quando:
-- Houver erros para analisar
-- Precisar sugerir soluções
-
-**debug.analyze_error(error_message)** - Analisar erro
-
-### ⚙️ System Info
-**system.get_timestamp()** - Timestamp atual
-**system.get_env_var(var_name)** - Ler variável de ambiente
+EXEMPLOS:
+GET: <tool>{"tool": "api", "action": "call_api", "url": "https://api.github.com/users/octocat", "method": "GET"}</tool>
+POST: <tool>{"tool": "api", "action": "call_api", "url": "https://api.exemplo.com/users", "method": "POST", "data": {"nome": "João", "email": "joao@example.com"}}</tool>
+Headers: <tool>{"tool": "api", "action": "call_api", "url": "http://...", "method": "POST", "headers": {"Authorization": "Bearer token", "X-Custom": "value"}, "data": {...}}</tool>
 
 ---
 
-## IMPORTANTE: Como decidir qual tool usar
+### 📁 File Operations
+Use quando precisar: ler, escrever ou criar arquivos
 
-**Perguntas que DEVEM usar api.call_api:**
-- "Busque dados de [URL]"
-- "Chame a API [nome]"
-- "Faça uma requisição para..."
-- "Obtenha informações de [endpoint]"
-- "Consulte [serviço web]"
+FORMATO:
+Ler: <tool>{"tool": "file", "action": "read_file", "filepath": "./arquivo.txt"}</tool>
+Escrever: <tool>{"tool": "file", "action": "write_file", "filepath": "./output.txt", "content": "conteúdo aqui"}</tool>
 
-**Formato obrigatório:** <tool>{"tool": "...", "action": "...", "parametros": "..."}</tool>
+---
+
+### 📊 JSON Processing
+Use quando precisar: validar ou fazer parse de JSON
+
+FORMATO:
+<tool>{"tool": "json", "action": "parse_json", "content": "{\\"key\\": \\"value\\"}"}</tool>
+<tool>{"tool": "json", "action": "validate_json", "content": "{\\"key\\": \\"value\\"}"}</tool>
+
+---
+
+### 🐛 Debug & Analysis
+Use quando houver erros para analisar
+
+FORMATO:
+<tool>{"tool": "debug", "action": "analyze_error", "error_message": "descrição do erro"}</tool>
+
+---
+
+### ⚙️ System Info
+Use quando precisar de timestamp ou variáveis de ambiente
+
+FORMATO:
+<tool>{"tool": "system", "action": "get_timestamp"}</tool>
+<tool>{"tool": "system", "action": "get_env_var", "var_name": "HOME"}</tool>
+
 """
 
     def _parse_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
         """Parse de chamadas de tool no formato <tool>{...}</tool>"""
+        # Tenta primeiro o padrão padrão
         pattern = r'<tool>(.*?)</tool>'
         match = re.search(pattern, text, re.DOTALL)
 
         if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                return None
+            json_str = match.group(1).strip()
+
+            # Tenta fazer parse do JSON
+            result = self._try_parse_json(json_str)
+            if result:
+                return result
+
+        # Se não encontrou, tenta extrair JSON entre chaves
+        # Padrão alternativo: procura por { ... } mesmo sem <tool> tags
+        json_pattern = r'\{.*?"tool".*?"action".*?\}'
+        json_match = re.search(json_pattern, text, re.DOTALL)
+
+        if json_match:
+            json_str = json_match.group(0)
+            result = self._try_parse_json(json_str)
+            if result:
+                return result
+
+        return None
+
+    def _try_parse_json(self, json_str: str) -> Optional[Dict[str, Any]]:
+        """Tenta fazer parse de JSON com várias estratégias"""
+        # Estratégia 1: Tentar parse direto
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+
+        # Estratégia 2: Converter single quotes para double quotes
+        try:
+            # Replace single quotes que envolvem valores
+            fixed_json = re.sub(r"'([^']*)'", r'"\1"', json_str)
+            return json.loads(fixed_json)
+        except json.JSONDecodeError:
+            pass
+
+        # Estratégia 3: Remover comentários e espaços problemáticos
+        try:
+            # Remove trailing commas
+            fixed_json = re.sub(r',(\s*[}\]])', r'\1', json_str)
+            # Replace single quotes
+            fixed_json = re.sub(r"'([^']*)'", r'"\1"', fixed_json)
+            return json.loads(fixed_json)
+        except json.JSONDecodeError:
+            pass
+
+        print(f"⚠️  Falha ao fazer parse de JSON após 3 tentativas")
+        print(f"   JSON string: {json_str[:100]}...")
         return None
 
     def _execute_tool_from_call(self, tool_call: Dict[str, Any]) -> ToolResult:
@@ -142,20 +184,57 @@ Histórico da conversa:
 
 Pergunta do usuário: {enhanced_query}
 
-Instruções:
-- SEMPRE use uma tool quando a pergunta pedir para:
-  * Buscar/obter/consultar dados de URL, API ou serviço web
-  * Ler ou escrever arquivos
-  * Executar operações de sistema
-- Se precisar chamar uma tool, use EXATAMENTE o formato: <tool>{{...}}</tool>
-- Forneça respostas claras e acionáveis
-- Se encontrar um erro, use debug.analyze_error
-- Sempre explique o que você está fazendo ANTES de chamar a tool
-- Máximo de 2 chamadas de tool por resposta
+═══════════════════════════════════════════════════════════════════════════════
 
-EXEMPLO: Se o usuário pedir "busque dados de https://api.exemplo.com/users", você DEVE responder:
-"Vou fazer uma chamada HTTP para obter os dados:
-<tool>{{"tool": "api", "action": "call_api", "url": "https://api.exemplo.com/users", "method": "GET"}}</tool>"
+🔴 INSTRUÇÕES CRÍTICAS - LEIA COM ATENÇÃO:
+
+## Transaction ID:
+Se você vir "[SISTEMA: Transaction ID gerado automaticamente: ...]" na pergunta:
+- USE esse ID nas chamadas de API
+- É um UUID único gerado para esta ação
+- Se o usuário não informou um ID, use o gerado automaticamente
+
+## Quando chamar uma TOOL:
+1. Você PRECISA chamar uma tool se a pergunta pede para chamar API, ler/escrever arquivo, etc
+2. A tool DEVE ser chamada em PRIMEIRO, no formato EXATO: <tool>{{"tool": "...", "action": "...", ...}}</tool>
+3. DEPOIS da tool, você pode explicar o que fez ou pedir próximos passos
+
+❌ ERRADO (Explicação ANTES da tool):
+"Vou fazer uma chamada HTTP para..."
+<tool>{{...}}</tool>
+
+✅ CORRETO (Tool PRIMEIRO, depois explicação):
+<tool>{{"tool": "api", "action": "call_api", "url": "...", "method": "GET"}}</tool>
+"Acabo de executar a chamada HTTP. Os dados foram..."
+
+═══════════════════════════════════════════════════════════════════════════════
+
+## CRITÉRIOS DE PARADA (QUANDO PARAR):
+⛔ VOCÊ DEVE PARAR (NÃO chamar mais tools) SE:
+1. A ação foi executada com sucesso (success=True) E resolveu o problema original
+2. Você receber um erro recuperável e já tentou uma solução alternativa
+3. A resposta final responde completamente à pergunta do usuário
+4. Você não consegue executar a ação mesmo após várias tentativas
+
+✅ SINAIS DE CONCLUSÃO (termine com resposta clara):
+- "Ação concluída com sucesso"
+- "Problema resolvido"
+- "Pronto! [descrição do que foi feito]"
+- "A solicitação foi processada"
+- "Feito! [confirmação do resultado]"
+
+═══════════════════════════════════════════════════════════════════════════════
+
+EXEMPLO CORRETO COMPLETO:
+
+Usuário: "busque dados de https://api.github.com/users/octocat"
+
+Sua resposta:
+<tool>{{"tool": "api", "action": "call_api", "url": "https://api.github.com/users/octocat", "method": "GET"}}</tool>
+
+Encontrei os dados do usuário octocat. A requisição foi bem-sucedida e retornou as informações do perfil.
+
+═══════════════════════════════════════════════════════════════════════════════
 
 Sua resposta:
 """
@@ -210,12 +289,114 @@ Sua resposta:
 
         return user_query
 
+    def _is_conclusive_response(self, response_text: str) -> bool:
+        """Detecta se a resposta indica conclusão da tarefa"""
+        conclusive_patterns = [
+            'ação concluída',
+            'problema resolvido',
+            'pronto',
+            'feito',
+            'solicitação foi processada',
+            'sucesso',
+            'concluído com êxito',
+            'tarefa finalizada',
+            'operação completa'
+        ]
+
+        response_lower = response_text.lower()
+        return any(pattern in response_lower for pattern in conclusive_patterns)
+
+    def _detect_repeated_tool_call(self, tool_call: Dict[str, Any]) -> bool:
+        """Detecta se a mesma tool foi chamada repetidas vezes (indicativo de loop)"""
+        if not self.execution_history:
+            return False
+
+        # Extrair identificador da tool
+        current_tool_id = f"{tool_call.get('tool')}.{tool_call.get('action')}"
+
+        # Contar quantas vezes essa tool foi executada recentemente
+        recent_calls = [
+            exec_history for exec_history in self.execution_history[-3:]
+            if exec_history['tool_id'] == current_tool_id
+        ]
+
+        # Se a mesma tool foi chamada 2+ vezes nos últimos 3, é um loop
+        return len(recent_calls) >= 2
+
+    def _detect_infinite_loop(self, current_query: str) -> bool:
+        """Detecta se estamos em um loop infinito (mesma query reconstruída)"""
+        if not self.execution_history:
+            return False
+
+        # Se as últimas 2 execuções tiveram tools idênticas, é suspeito de loop
+        if len(self.execution_history) >= 2:
+            last_two = self.execution_history[-2:]
+            if (last_two[0]['tool_id'] == last_two[1]['tool_id'] and
+                last_two[0]['success'] == last_two[1]['success']):
+                return True
+
+        return False
+
+    def _reset_execution_state(self):
+        """Reseta o estado de execução para nova conversa"""
+        self.execution_history = []
+        self.last_tool_call = None
+        self.consecutive_successes = 0
+
+    def _extract_transaction_id(self, text: str) -> Optional[str]:
+        """Extrai transaction ID da query do usuário"""
+        # Padrões comuns para transaction ID
+        patterns = [
+            r'transaction\s+id:?\s*([a-f0-9\-]{36})',  # UUID format
+            r'transaction\s+id:?\s*([a-f0-9\-]+)',      # Qualquer hexadecimal
+            r'txn[:\s]+([a-f0-9\-]{36})',               # txn id
+            r'id:?\s*([a-f0-9\-]{36})',                 # Genérico: id
+        ]
+
+        text_lower = text.lower()
+        for pattern in patterns:
+            match = re.search(pattern, text_lower, re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+        return None
+
+    def _generate_transaction_id(self) -> str:
+        """Gera um transaction ID único (UUID v4)"""
+        return str(uuid.uuid4())
+
+    def _enrich_query_with_transaction_id(self, user_query: str) -> str:
+        """
+        Se a query não contém transaction ID, gera um automaticamente
+        e adiciona à query para o agent usar
+        """
+        transaction_id = self._extract_transaction_id(user_query)
+
+        if not transaction_id:
+            # Gerar novo transaction ID
+            transaction_id = self._generate_transaction_id()
+
+            # Adicionar à query para o agent saber que há um ID disponível
+            enriched = f"""{user_query}
+
+[SISTEMA: Transaction ID gerado automaticamente: {transaction_id}]"""
+
+            print(f"📝 Transaction ID gerado: {transaction_id}")
+            return enriched
+        else:
+            print(f"📝 Transaction ID encontrado: {transaction_id}")
+            return user_query
+
     def chat(self, user_query: str) -> str:
-        """Chat com iteração automática de tools"""
+        """Chat com iteração automática de tools com critérios de parada melhorados"""
         print(f"\n🤖 Agent processando: {user_query}\n")
 
+        # Enriquecer query com transaction ID se necessário
+        enriched_query = self._enrich_query_with_transaction_id(user_query)
+
         iteration = 0
-        current_query = user_query
+        current_query = enriched_query
+        self._reset_execution_state()  # Limpar estado anterior
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -242,28 +423,66 @@ Sua resposta:
                 })
                 return response_text
 
+            # Detectar padrões problemáticos
+            if self._detect_repeated_tool_call(tool_call):
+                print("⚠️  [PARADA] Mesma tool sendo executada repetidamente (loop detectado)")
+                print(f"Resposta final do agent:\n{response_text}\n")
+                return response_text + "\n\n[Sistema: Loop detectado, interrompendo iterações]"
+
+            if self._detect_infinite_loop(current_query):
+                print("⚠️  [PARADA] Loop infinito detectado (mesmas execuções)")
+                return response_text + "\n\n[Sistema: Loop infinito detectado, interrompendo]"
+
             # Executar tool
             print(f"🔧 Executando tool: {tool_call.get('tool')}.{tool_call.get('action')}")
             result = self._execute_tool_from_call(tool_call)
-
             print(f"📊 Resultado: {result}\n")
 
-            # Construir nova query com resultado
+            # Registrar execução no histórico
+            tool_id = f"{tool_call.get('tool')}.{tool_call.get('action')}"
+            self.execution_history.append({
+                'iteration': iteration,
+                'tool_id': tool_id,
+                'success': result.success,
+                'error': result.error
+            })
+
+            # Lógica de parada após sucesso
             if result.success:
-                current_query = f"""Resultado da execução anterior:
-Tool: {tool_call.get('tool')}.{tool_call.get('action')}
+                self.consecutive_successes += 1
+
+                # Se houve sucesso, adicionar sinal explícito ao LLM
+                current_query = f"""[✅ AÇÃO EXECUTADA COM SUCESSO]
+
+Resultado da execução anterior:
+Tool: {tool_id}
 Sucesso: Sim
 Dados: {json.dumps(result.data, ensure_ascii=False)[:500]}
 
 Pergunta original: {user_query}
-Por favor, use esse resultado para responder a pergunta original ou execute a próxima ação necessária."""
+
+IMPORTANTE: A ação anterior foi executada com SUCESSO. Se isso resolve o problema original, 
+RESPONDA APENAS CONFIRMANDO QUE FOI RESOLVIDO e NÃO CHAME MAIS TOOLS.
+Caso contrário, indique qual é o próximo passo necessário."""
+
+                # Se conseguimos sucesso na primeira tentativa e resposta é conclusiva, parar
+                if self.consecutive_successes >= 1 and self._is_conclusive_response(response_text):
+                    print("✅ [PARADA] Ação bem-sucedida e conclusão detectada")
+                    return response_text
             else:
-                current_query = f"""Erro na execução anterior:
-Tool: {tool_call.get('tool')}.{tool_call.get('action')}
+                # Reset counter em caso de erro
+                self.consecutive_successes = 0
+
+                current_query = f"""[❌ ERRO NA EXECUÇÃO]
+
+Erro na execução anterior:
+Tool: {tool_id}
 Erro: {result.error}
 
 Pergunta original: {user_query}
-Por favor, suira outro approach ou analise o erro."""
+
+Por favor, tente um approach diferente ou analise o erro. Se o erro persistir após 
+uma nova tentativa, responda com uma explicação clara do problema."""
 
         return f"⚠️  Máximo de iterações ({self.max_iterations}) atingido"
 
