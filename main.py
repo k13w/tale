@@ -32,72 +32,6 @@ def initialize_agent() -> Agent:
     )
     return agent
 
-def create_sample_docs():
-    """Cria documentos de exemplo"""
-    docs_dir = Path("./docs")
-    docs_dir.mkdir(exist_ok=True)
-
-    # Exemplo 1: API Documentation
-    api_doc = """
-# Documentação da API
-
-## Endpoints disponíveis
-
-### GET /users
-Retorna lista de usuários
-- Status: 200
-- Response: {"users": [...]}
-
-### GET /users/{id}
-Retorna um usuário específico
-- Parâmetros: id (obrigatório)
-- Status: 200, 404
-
-### POST /users
-Cria novo usuário
-- Body: {"name": string, "email": string}
-- Status: 201
-
-## Erros comuns
-
-- 401: Autenticação necessária
-- 404: Recurso não encontrado
-- 500: Erro no servidor
-"""
-
-    # Exemplo 2: Troubleshooting
-    troubleshooting_doc = """
-# Guia de Troubleshooting
-
-## Problema: Timeout em requisições
-
-### Causas possíveis
-1. Servidor lento
-2. Problema de rede
-3. Timeout muito curto
-
-### Soluções
-1. Aumentar timeout para 30s
-2. Verificar conectividade
-3. Tentar novamente
-
-## Problema: Erro 401
-
-### Causas
-- Credenciais inválidas
-- Token expirado
-
-### Soluções
-1. Verificar API key
-2. Renovar token
-3. Verificar permissões
-"""
-
-    # Salvar documentos
-    (docs_dir / "api.md").write_text(api_doc)
-    (docs_dir / "troubleshooting.md").write_text(troubleshooting_doc)
-
-    console.print("[green]✓ Documentos de exemplo criados em ./docs/[/green]")
 
 def main():
     """Função principal"""
@@ -106,7 +40,6 @@ def main():
     # Criar docs de exemplo se não existirem
     if not Path("./docs").exists():
         console.print("[yellow]Criando documentos de exemplo...[/yellow]")
-        create_sample_docs()
 
     # Inicializar agent
     console.print("[cyan]Inicializando agent...[/cyan]")
@@ -150,4 +83,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
